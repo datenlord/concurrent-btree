@@ -30,11 +30,12 @@ struct NodeContent<K: Ord + Clone, V: Clone> {
 
 enum ValueCell<K: Ord + Clone, V: Clone> {
     Node(Arc<Node<K, V>>), // non-leaf nodes store pointers to the son nodes
-    Value(V),              // leadf nodes store values
+    Value(V),              // leaf nodes store values
 }
 
 enum SearchResult<K: Ord + Clone, V: Clone> {
     Found(V),
+    NotFound(),
     GoDown(Arc<Node<K, V>>),
     GoRight(Arc<Node<K, V>>),
     Error(),
@@ -93,12 +94,12 @@ impl<K: Ord + Clone, V: Clone> BLinkTree<K, V> {
     /// use btree::BLinkTree;
     ///
     /// let mut tree = BLinkTree::new(5, (i32::MIN, "dummy_value"), (i32::MAX, "dummy_value"));
-    /// assert_eq!(tree.insert(37, "a"), None);
-    /// assert_eq!(tree.is_empty(), false);
+    /// assert_eq!(None, tree.insert(37, "a"));
+    /// assert_eq!(false, tree.is_empty());
     ///
     /// tree.insert(37, "b");
-    /// assert_eq!(tree.insert(37, "c"), Some("b"));
-    /// assert_eq!(tree.get(&37), Some(&"c"));
+    /// assert_eq!(Some("b"), tree.insert(37, "c"));
+    /// assert_eq!(Some("c"), tree.get(&37));
     /// ```
     pub fn insert(&self, key: K, value: V) -> Option<V> {
         let mut path_stack = Vec::new();
@@ -129,8 +130,27 @@ impl<K: Ord + Clone, V: Clone> BLinkTree<K, V> {
         let mut k = key;
         let mut v: ValueCell<K, V> = ValueCell::Value(value);
         let mut current_node_content_arc = Arc::clone(&current_node.content);
-        let mut current_node_wg = current_node_content_arc.write().unwrap();
-        self.move_right();
+        let mut current_node_content_ptr = Arc::as_ptr(&current_node_content_arc);
+        let mut current_node_wg = unsafe {
+            (*current_node_content_ptr).write().unwrap()
+        };
+        // move right
+        loop {
+            let search_result = current_node.scan_node_wg(&k, &current_node_wg);
+            if let SearchResult::GoRight(next) = search_result {
+                // first get next node's guard, then drop current node's guard
+                current_node = next;
+                current_node_content_arc = Arc::clone(&current_node.content);
+                current_node_content_ptr = Arc::as_ptr(&current_node_content_arc);
+                let old_node_wg = current_node_wg;
+                current_node_wg = unsafe {
+                    (*current_node_content_ptr).write().unwrap()
+                };
+                drop(old_node_wg);
+            } else {
+                break
+            }
+        }
 
         loop {
             // replace or insert value
@@ -192,31 +212,36 @@ impl<K: Ord + Clone, V: Clone> BLinkTree<K, V> {
                 } else {
                     return None;
                 }
+                // first get next node's guard, then drop current node's guard
                 current_node_content_arc = Arc::clone(&current_node.content);
-                let next_node_wg = current_node_content_arc.write().unwrap();
-                // self.move_right();
-                drop(current_node_wg);
-                current_node_wg = next_node_wg;
+                current_node_content_ptr = Arc::as_ptr(&current_node_content_arc);
+                let old_node_wg = current_node_wg;
+                current_node_wg = unsafe {
+                    (*current_node_content_ptr).write().unwrap()
+                };
+                // move right
+                loop {
+                    let search_result = current_node.scan_node_wg(&k, &current_node_wg);
+                    if let SearchResult::GoRight(next) = search_result {
+                        // first get next node's guard, then drop current node's guard
+                        current_node = next;
+                        current_node_content_arc = Arc::clone(&current_node.content);
+                        current_node_content_ptr = Arc::as_ptr(&current_node_content_arc);
+                        let old_node_wg = current_node_wg;
+                        current_node_wg = unsafe {
+                            (*current_node_content_ptr).write().unwrap()
+                        };
+                        drop(old_node_wg);
+                    } else {
+                        break
+                    }
+                }
+                drop(old_node_wg);
             }
         }
 
         self.size.fetch_add(1, Ordering::Relaxed);
         None
-    }
-
-    fn move_right(&self) {
-        // loop {
-        //     let search_result = current_node.scan_node_wg(&k, &current_node_wg);
-        //     match search_result {
-        //         SearchResult::GoRight(next) => {
-        //             let old_node_wg = current_node_wg;
-        //             current_node_wg = next.content.write().unwrap();
-        //             drop(old_node_wg);
-        //             current_node = Arc::clone(&next);
-        //         }
-        //         _ => break,
-        //     }
-        // }
     }
 
     fn find_leaf_node(&self, key: &K) -> Arc<Node<K, V>> {
@@ -249,8 +274,8 @@ impl<K: Ord + Clone, V: Clone> BLinkTree<K, V> {
     ///
     /// let mut tree = BLinkTree::new(5, (i32::MIN, "dummy_value"), (i32::MAX, "dummy_value"));
     /// tree.insert(1, "a");
-    /// assert_eq!(tree.remove(&1), Some("a"));
-    /// assert_eq!(tree.remove(&1), None);
+    /// assert_eq!(Some("a"), tree.remove(&1));
+    /// assert_eq!(None, tree.remove(&1));
     /// ```
     pub fn remove(&self, key: &K) -> Option<V> {
         // find until the leaf node contains the given key
@@ -285,8 +310,8 @@ impl<K: Ord + Clone, V: Clone> BLinkTree<K, V> {
     ///
     /// let mut tree = BLinkTree::new(5, (i32::MIN, "dummy_value"), (i32::MAX, "dummy_value"));
     /// tree.insert(1, "a");
-    /// assert_eq!(tree.get(&1), Some(&"a"));
-    /// assert_eq!(tree.get(&2), None);
+    /// assert_eq!(Some("a"), tree.get(&1));
+    /// assert_eq!(None, tree.get(&2));
     /// ```
     pub fn get(&self, key: &K) -> Option<V> {
         // find until the leaf node contains the given key
@@ -298,7 +323,8 @@ impl<K: Ord + Clone, V: Clone> BLinkTree<K, V> {
                 SearchResult::GoDown(next) | SearchResult::GoRight(next) => {
                     current_node = Arc::clone(&next);
                 }
-                SearchResult::Error() => panic!(""),
+                SearchResult::NotFound() => return None,
+                SearchResult::Error() => panic!("Unrecoverable error occurs."),
             }
         }
     }
@@ -325,9 +351,9 @@ impl<K: Ord + Clone, V: Clone> BLinkTree<K, V> {
     /// }
     /// ```
     pub fn range<T, R>(&self, range: R) -> (Vec<Arc<K>>, Vec<Arc<V>>)
-    where
-        T: Ord + ?Sized,
-        R: RangeBounds<T>,
+        where
+            T: Ord + ?Sized,
+            R: RangeBounds<T>,
     {
         (vec![], vec![])
     }
@@ -340,9 +366,9 @@ impl<K: Ord + Clone, V: Clone> BLinkTree<K, V> {
     /// use btree::BLinkTree;
     ///
     /// let mut tree = BLinkTree::new(5, (i32::MIN, "dummy_value"), (i32::MAX, "dummy_value"));
-    /// assert_eq!(tree.len(), 2);
+    /// assert_eq!(2, tree.len());
     /// tree.insert(1, "a");
-    /// assert_eq!(tree.len(), 3);
+    /// assert_eq!(3, tree.len());
     /// ```
     pub fn len(&self) -> usize {
         self.size.load(Ordering::Relaxed)
@@ -406,10 +432,10 @@ impl<K: Ord + Clone, V: Clone> Node<K, V> {
                             Some(pointer) => {
                                 (SearchResult::GoRight(Arc::clone(&pointer)), node_rg)
                             }
-                            None => (SearchResult::Error(), node_rg),
+                            None => (SearchResult::NotFound(), node_rg),
                         }
                     } else {
-                        (SearchResult::Error(), node_rg)
+                        (SearchResult::NotFound(), node_rg)
                     }
                 }
             }
@@ -425,7 +451,7 @@ impl<K: Ord + Clone, V: Clone> Node<K, V> {
                 Err(pos) => {
                     if *pos == node_rg.keys.len() {
                         if key <= &node_rg.high_key {
-                            match node_rg.values.get(*pos + 1).unwrap() {
+                            match node_rg.values.get(*pos).unwrap() {
                                 ValueCell::Node(next) => {
                                     (SearchResult::GoDown(Arc::clone(next)), node_rg)
                                 }
@@ -446,7 +472,7 @@ impl<K: Ord + Clone, V: Clone> Node<K, V> {
                     }
                 }
             }
-        }
+        };
     }
 
     pub(crate) fn scan_node_wg(
@@ -470,10 +496,10 @@ impl<K: Ord + Clone, V: Clone> Node<K, V> {
                             Some(pointer) => {
                                 SearchResult::GoRight(Arc::clone(&pointer))
                             }
-                            None => SearchResult::Error(),
+                            None => SearchResult::NotFound(),
                         }
                     } else {
-                        SearchResult::Error()
+                        SearchResult::NotFound()
                     }
                 }
             }
@@ -489,7 +515,7 @@ impl<K: Ord + Clone, V: Clone> Node<K, V> {
                 Err(pos) => {
                     if pos == node_wg.keys.len() {
                         if key <= &node_wg.high_key {
-                            match node_wg.values.get(pos + 1).unwrap() {
+                            match node_wg.values.get(pos).unwrap() {
                                 ValueCell::Node(next) => {
                                     SearchResult::GoDown(Arc::clone(next))
                                 }
@@ -510,7 +536,7 @@ impl<K: Ord + Clone, V: Clone> Node<K, V> {
                     }
                 }
             }
-        }
+        };
     }
 }
 
@@ -541,6 +567,22 @@ impl<K: Ord + Clone, V: Clone> NodeContent<K, V> {
                 }
             }
             Err(_) => return None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sequential_insert() {
+        let mut tree = BLinkTree::new(2, (i32::MIN, i32::MIN), (i32::MAX, i32::MAX));
+        for i in (0..100).rev() {
+            assert_eq!(None, tree.insert(i, i));
+        }
+        for i in (0..100).rev() {
+            assert_eq!(Some(i), tree.get(&i));
         }
     }
 }
