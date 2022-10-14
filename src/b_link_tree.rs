@@ -1,16 +1,17 @@
 use log::warn;
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::{
     mem::swap,
     ops::RangeBounds,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        Arc,
     },
 };
 
 /// An ordered map based on a [B-Link-Tree].
 #[derive(Debug)]
-pub struct BLinkTree<K: Ord + Clone, V: Clone> {
+pub struct BLinkTree<K: Ord, V> {
     // each node contains at most 2 * half_maximum_entries values
     half_maximum_entries: usize,
     // root node of this b-tree
@@ -23,7 +24,7 @@ pub struct BLinkTree<K: Ord + Clone, V: Clone> {
 
 /// Tree node
 #[derive(Debug)]
-struct Node<K: Ord + Clone, V: Clone> {
+struct Node<K: Ord, V> {
     // leaf node or not (never change after node has been created)
     is_leaf: bool,
     // contents of this node, protected by read write lock
@@ -32,13 +33,13 @@ struct Node<K: Ord + Clone, V: Clone> {
 
 /// Tree node contents, should be protected by read write lock
 #[derive(Debug)]
-struct NodeContent<K: Ord + Clone, V: Clone> {
+struct NodeContent<K: Ord, V> {
     // high key, an upper bound on keys stored in the subtree with this node as the root
-    high_key: K,
+    high_key: Arc<K>,
     // pointer to the right sibling node at the same level, null if this node is the rightmost
     link_pointer: Option<Arc<Node<K, V>>>,
     // keys, at most 2 * half_maximum_entries keys in one node
-    keys: Vec<K>,
+    keys: Vec<Arc<K>>,
     // non-leaf nodes: store son nodes, length == keys.len() + 1, son node values[i]' keys are smaller than keys[i]
     // leaf nodes: store values, length == keys.len()
     values: Vec<ValueCell<K, V>>,
@@ -46,17 +47,17 @@ struct NodeContent<K: Ord + Clone, V: Clone> {
 
 /// Value cell, stores value or node pointer
 #[derive(Debug)]
-enum ValueCell<K: Ord + Clone, V: Clone> {
+enum ValueCell<K: Ord, V> {
     // non-leaf node stores pointers to the son nodes
     Node(Arc<Node<K, V>>),
     // leaf node stores values
-    Value(V),
+    Value(Arc<V>),
 }
 
 /// Search status
-enum SearchResult<K: Ord + Clone, V: Clone> {
+enum SearchResult<K: Ord, V> {
     // target key has its corresponding value
-    Found(V),
+    Found(Arc<V>),
     // target key doesn't have its corresponding value
     NotFound(),
     // traverse to child node
@@ -67,7 +68,7 @@ enum SearchResult<K: Ord + Clone, V: Clone> {
     Error(),
 }
 
-impl<K: Ord + Clone, V: Clone> BLinkTree<K, V> {
+impl<K: Ord, V> BLinkTree<K, V> {
     /// Makes a new `BLinkTree`, with two initial entries in it.
     /// Each node contains at most 2 * half_maximum_entries entries.
     ///
@@ -95,28 +96,30 @@ impl<K: Ord + Clone, V: Clone> BLinkTree<K, V> {
             swap(&mut kv_pair1, &mut kv_pair2);
         }
         // construct two leaf nodes
+        let tail_high_key_arc = Arc::new(kv_pair2.0);
         let leaf_nodes_tail = Arc::new(Node::new(
             true,
-            kv_pair2.0.clone(),
+            Arc::clone(&tail_high_key_arc),
             None,
-            vec![kv_pair2.0.clone()],
-            vec![ValueCell::Value(kv_pair2.1)],
+            vec![Arc::clone(&tail_high_key_arc)],
+            vec![ValueCell::Value(Arc::new(kv_pair2.1))],
         ));
+        let head_high_key_arc = Arc::new(kv_pair1.0);
         let leaf_nodes_head = Arc::new(Node::new(
             true,
-            kv_pair1.0.clone(),
+            Arc::clone(&head_high_key_arc),
             Some(Arc::clone(&leaf_nodes_tail)),
-            vec![kv_pair1.0.clone()],
-            vec![ValueCell::Value(kv_pair1.1)],
+            vec![Arc::clone(&head_high_key_arc)],
+            vec![ValueCell::Value(Arc::new(kv_pair1.1))],
         ));
         // construct tree
         BLinkTree {
             half_maximum_entries,
             root: RwLock::new(Arc::new(Node::new(
                 false,
-                kv_pair2.0.clone(),
+                Arc::clone(&tail_high_key_arc),
                 None,
-                vec![kv_pair2.0.clone()],
+                vec![Arc::clone(&tail_high_key_arc)],
                 vec![
                     ValueCell::Node(Arc::clone(&leaf_nodes_head)),
                     ValueCell::Node(Arc::clone(&leaf_nodes_tail)),
@@ -141,28 +144,29 @@ impl<K: Ord + Clone, V: Clone> BLinkTree<K, V> {
     /// assert_eq!(false, tree.is_empty());
     ///
     /// tree.insert(1, "b");
-    /// assert_eq!(Some("b"), tree.insert(1, "c"));
-    /// assert_eq!(Some("c"), tree.get(&1));
+    /// assert_eq!("b", *tree.insert(1, "c").unwrap());
+    /// assert_eq!("c", *tree.get(&1).unwrap());
     /// ```
-    pub fn insert(&self, key: K, value: V) -> Option<V> {
+    pub fn insert(&self, key: K, value: V) -> Option<Arc<V>> {
+        let mut k = Arc::new(key);
         let mut path_stack = Vec::new();
         // init old node and current node
-        let root_rg = self.root.read().unwrap();
+        let root_rg = self.root.read();
         let mut current_node = Arc::clone(&root_rg);
         drop(root_rg);
         let mut old_node;
         // find from non-leaf node to leaf node
         while !current_node.is_leaf {
             old_node = Arc::clone(&current_node);
-            let (search_result, old_node_rg) = old_node.scan_node_rg(&key);
+            let (search_result, old_node_rg) = old_node.scan_node_rg(&k);
             match search_result {
                 SearchResult::GoDown(next) => {
                     path_stack.push(Arc::clone(&old_node));
                     current_node = Arc::clone(&next);
-                    if old_node_rg.high_key < key {
+                    if *old_node_rg.high_key < *k {
                         drop(old_node_rg);
-                        let mut old_node_wg = old_node.content.write().unwrap();
-                        old_node_wg.high_key = key.clone();
+                        let mut old_node_wg = old_node.content.write();
+                        old_node_wg.high_key = Arc::clone(&k);
                     }
                 }
                 SearchResult::GoRight(next) => current_node = Arc::clone(&next),
@@ -173,11 +177,10 @@ impl<K: Ord + Clone, V: Clone> BLinkTree<K, V> {
             }
         }
 
-        let mut k = key;
-        let mut v: ValueCell<K, V> = ValueCell::Value(value);
+        let mut v: ValueCell<K, V> = ValueCell::Value(Arc::new(value));
         let mut current_node_content_arc = Arc::clone(&current_node.content);
         let mut current_node_content_ptr = Arc::as_ptr(&current_node_content_arc);
-        let mut current_node_wg = unsafe { (*current_node_content_ptr).write().unwrap() };
+        let mut current_node_wg = unsafe { (*current_node_content_ptr).write() };
         // move right
         loop {
             let search_result = current_node.scan_node_wg(&k, &current_node_wg);
@@ -188,7 +191,7 @@ impl<K: Ord + Clone, V: Clone> BLinkTree<K, V> {
                 current_node_content_ptr = Arc::as_ptr(&current_node_content_arc);
                 let old_node_wg = current_node_wg;
                 // SAFETY: current_node_wg borrows current_node_content_arc, drop old_node_wg before previous current_node_content_arc is dropped
-                current_node_wg = unsafe { (*current_node_content_ptr).write().unwrap() };
+                current_node_wg = unsafe { (*current_node_content_ptr).write() };
                 drop(old_node_wg);
             } else {
                 break;
@@ -259,7 +262,7 @@ impl<K: Ord + Clone, V: Clone> BLinkTree<K, V> {
                     current_node_content_arc = Arc::clone(&current_node.content);
                     current_node_content_ptr = Arc::as_ptr(&current_node_content_arc);
                     old_node_wg = current_node_wg;
-                    current_node_wg = unsafe { (*current_node_content_ptr).write().unwrap() };
+                    current_node_wg = unsafe { (*current_node_content_ptr).write() };
                 } else {
                     break;
                 }
@@ -273,7 +276,7 @@ impl<K: Ord + Clone, V: Clone> BLinkTree<K, V> {
                         current_node_content_ptr = Arc::as_ptr(&current_node_content_arc);
                         let old_node_wg = current_node_wg;
                         // SAFETY: current_node_wg borrows current_node_content_arc, drop old_node_wg before previous current_node_content_arc is dropped
-                        current_node_wg = unsafe { (*current_node_content_ptr).write().unwrap() };
+                        current_node_wg = unsafe { (*current_node_content_ptr).write() };
                         drop(old_node_wg);
                     } else {
                         break;
@@ -289,7 +292,7 @@ impl<K: Ord + Clone, V: Clone> BLinkTree<K, V> {
 
     fn find_leaf_node(&self, key: &K) -> Option<Arc<Node<K, V>>> {
         // init old node and current node
-        let root_rg = self.root.read().unwrap();
+        let root_rg = self.root.read();
         let mut current_node = Arc::clone(&root_rg);
         drop(root_rg);
         let mut old_node;
@@ -320,10 +323,10 @@ impl<K: Ord + Clone, V: Clone> BLinkTree<K, V> {
     ///
     /// let tree = BLinkTree::new(5, (i32::MIN, "dummy_value"), (i32::MAX, "dummy_value"));
     /// tree.insert(1, "a");
-    /// assert_eq!(Some("a"), tree.remove(&1));
+    /// assert_eq!("a", *tree.remove(&1).unwrap());
     /// assert_eq!(None, tree.remove(&1));
     /// ```
-    pub fn remove(&self, key: &K) -> Option<V> {
+    pub fn remove(&self, key: &K) -> Option<Arc<V>> {
         let mut current_node;
         if let Some(node) = self.find_leaf_node(key) {
             current_node = node;
@@ -333,7 +336,7 @@ impl<K: Ord + Clone, V: Clone> BLinkTree<K, V> {
         // find until the leaf node contains the given key
         loop {
             // TODO: use read guard to search, then upgrade to write guard to delete
-            let mut current_node_wg = current_node.content.write().unwrap();
+            let mut current_node_wg = current_node.content.write();
             let search_result = current_node.scan_node_wg(key, &current_node_wg);
             match search_result {
                 SearchResult::Found(_) => {
@@ -373,10 +376,10 @@ impl<K: Ord + Clone, V: Clone> BLinkTree<K, V> {
     ///
     /// let tree = BLinkTree::new(5, (i32::MIN, "dummy_value"), (i32::MAX, "dummy_value"));
     /// tree.insert(1, "a");
-    /// assert_eq!(Some("a"), tree.get(&1));
+    /// assert_eq!("a", *tree.get(&1).unwrap());
     /// assert_eq!(None, tree.get(&2));
     /// ```
-    pub fn get(&self, key: &K) -> Option<V> {
+    pub fn get(&self, key: &K) -> Option<Arc<V>> {
         let mut current_node;
         if let Some(node) = self.find_leaf_node(key) {
             current_node = node;
@@ -467,7 +470,7 @@ impl<K: Ord + Clone, V: Clone> BLinkTree<K, V> {
     }
 }
 
-impl<K: Ord + Clone, V: Clone> Node<K, V> {
+impl<K: Ord, V> Node<K, V> {
     /// Makes a new tree node.
     /// Each node contains at most 2 * half_maximum_entries entries.
     ///
@@ -478,9 +481,9 @@ impl<K: Ord + Clone, V: Clone> Node<K, V> {
     /// leaf nodes: values.len() == keys.len()
     pub(crate) fn new(
         is_leaf: bool,
-        high_key: K,
+        high_key: Arc<K>,
         link_pointer: Option<Arc<Node<K, V>>>,
-        keys: Vec<K>,
+        keys: Vec<Arc<K>>,
         values: Vec<ValueCell<K, V>>,
     ) -> Node<K, V> {
         if is_leaf && values.len() != keys.len() {
@@ -504,15 +507,15 @@ impl<K: Ord + Clone, V: Clone> Node<K, V> {
         &self,
         key: &K,
     ) -> (SearchResult<K, V>, RwLockReadGuard<NodeContent<K, V>>) {
-        let node_rg = self.content.read().unwrap();
-        let key_pos = &node_rg.keys.binary_search(key);
+        let node_rg = self.content.read();
+        let key_pos = &node_rg.keys.binary_search_by(|probe| (**probe).cmp(key));
         return if self.is_leaf {
             // find until position's key == key
             match key_pos {
                 Ok(pos) => {
                     // value cells in leaf nodes should be value type
                     if let ValueCell::Value(val) = node_rg.values.get(*pos).unwrap() {
-                        (SearchResult::Found(val.clone()), node_rg)
+                        (SearchResult::Found(Arc::clone(val)), node_rg)
                     } else {
                         (SearchResult::Error(), node_rg)
                     }
@@ -536,7 +539,7 @@ impl<K: Ord + Clone, V: Clone> Node<K, V> {
                 Ok(pos) => {
                     // value cells in leaf nodes should be node type
                     if let ValueCell::Node(next) = node_rg.values.get(*pos).unwrap() {
-                        (SearchResult::GoDown(Arc::clone(next)), node_rg)
+                        (SearchResult::GoDown(Arc::clone(&next)), node_rg)
                     } else {
                         (SearchResult::Error(), node_rg)
                     }
@@ -571,14 +574,14 @@ impl<K: Ord + Clone, V: Clone> Node<K, V> {
         key: &K,
         node_wg: &RwLockWriteGuard<NodeContent<K, V>>,
     ) -> SearchResult<K, V> {
-        let key_pos = node_wg.keys.binary_search(key);
+        let key_pos = node_wg.keys.binary_search_by(|probe| (**probe).cmp(key));
         return if self.is_leaf {
             // find until position's key == key
             match key_pos {
                 Ok(pos) => {
                     // value cells in leaf nodes should be value type
                     if let ValueCell::Value(val) = node_wg.values.get(pos).unwrap() {
-                        SearchResult::Found(val.clone())
+                        SearchResult::Found(Arc::clone(val))
                     } else {
                         SearchResult::Error()
                     }
@@ -631,11 +634,11 @@ impl<K: Ord + Clone, V: Clone> Node<K, V> {
     }
 }
 
-impl<K: Ord + Clone, V: Clone> NodeContent<K, V> {
+impl<K: Ord, V> NodeContent<K, V> {
     pub(crate) fn new(
-        high_key: K,
+        high_key: Arc<K>,
         link_pointer: Option<Arc<Node<K, V>>>,
-        keys: Vec<K>,
+        keys: Vec<Arc<K>>,
         values: Vec<ValueCell<K, V>>,
     ) -> NodeContent<K, V> {
         return NodeContent {
@@ -647,7 +650,7 @@ impl<K: Ord + Clone, V: Clone> NodeContent<K, V> {
     }
 
     pub(crate) fn remove(&mut self, key: &K) -> Option<ValueCell<K, V>> {
-        let key_pos = self.keys.binary_search(key);
+        let key_pos = self.keys.binary_search_by(|probe| (**probe).cmp(key));
         return match key_pos {
             Ok(pos) => {
                 self.keys.remove(pos);
