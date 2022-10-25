@@ -1,7 +1,8 @@
 use btree::BLinkTree;
 use criterion::{criterion_group, criterion_main, Criterion};
+use parking_lot::RwLock;
 use std::collections::BTreeMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::thread;
 
 static THREAD_NUM: i32 = 20;
@@ -20,7 +21,7 @@ fn bench_btree_map(c: &mut Criterion) {
                 if i % THREAD_NUM != THREAD_NUM - thread_i {
                     continue;
                 }
-                b_tree_map_arc.write().unwrap().insert(i, i);
+                b_tree_map_arc.write().insert(i, i);
             }
         });
         handles.push(handle);
@@ -33,7 +34,7 @@ fn bench_btree_map(c: &mut Criterion) {
                 if i % THREAD_NUM != THREAD_NUM - thread_i {
                     continue;
                 }
-                b_tree_map.write().unwrap().insert(i, i);
+                b_tree_map.write().insert(i, i);
             }
         })
     });
@@ -52,7 +53,7 @@ fn bench_btree_map(c: &mut Criterion) {
                 if i % THREAD_NUM != THREAD_NUM - thread_i {
                     continue;
                 }
-                b_tree_map_arc.read().unwrap().get(&i).unwrap();
+                b_tree_map_arc.read().get(&i).unwrap();
             }
         });
         handles.push(handle);
@@ -65,7 +66,7 @@ fn bench_btree_map(c: &mut Criterion) {
                 if i % THREAD_NUM != THREAD_NUM - thread_i {
                     continue;
                 }
-                b_tree_map.read().unwrap().get(&i).unwrap();
+                b_tree_map.read().get(&i).unwrap();
             }
         })
     });
@@ -84,7 +85,7 @@ fn bench_btree_map(c: &mut Criterion) {
                 if i % THREAD_NUM != THREAD_NUM - thread_i {
                     continue;
                 }
-                b_tree_map_arc.write().unwrap().remove(&i);
+                b_tree_map_arc.write().remove(&i);
             }
         });
         handles.push(handle);
@@ -97,7 +98,7 @@ fn bench_btree_map(c: &mut Criterion) {
                 if i % THREAD_NUM != THREAD_NUM - thread_i {
                     continue;
                 }
-                b_tree_map.write().unwrap().remove(&i);
+                b_tree_map.write().remove(&i);
             }
         })
     });
